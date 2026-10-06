@@ -47,6 +47,7 @@ from .schemas import (
     RevisableWorksheetPatchRequest,
     RevisableWorksheetResponse,
     SolveRequest,
+    StepResultBindingRequest,
     StoredVariable,
     UnitSetAliasInfo,
     UnitSetAliasListResponse,
@@ -54,6 +55,7 @@ from .schemas import (
     UnitSetMigrationImportResponse,
     UnitSetMigrationPackage,
     UnitSetRef,
+    WorksheetBindingInfo,
     WorksheetBody,
     WorksheetDiagnoseRequest,
     WorksheetDiagnoseResponse,
@@ -102,6 +104,14 @@ app = FastAPI(
         "不变），整单重算后共同保存并递增修订号；同修订并发修改最多一项"
         "成功（其余 409），计算失败 422，写盘失败回滚，容器重建后仍可"
         "读取并继续修订。"
+        "POST /revisable-worksheets/{id}/bindings 把上游工作单的某个步骤"
+        "结果绑定为新建下游工作单的同名初始变量：提交步骤名、上游"
+        "expected_revision 与含绑定变量的下游工作单，以步骤结果的值和"
+        "单位覆盖该变量，下游整单计算成功才共同保存关联与下游；两单固定"
+        "同一份已发布定义集，仅一对一、不允许链式。此后修订上游时在同一"
+        "临界区覆盖绑定变量、整单重算下游并把两单共同落盘（下游失败 422 "
+        "或写盘失败时两单都不变）；下游可改其他变量或步骤，直接改绑定"
+        "变量 422，上游不存在 404，修订号过期 409；容器重建后关联仍生效。"
         "可通过 POST /custom-unit-sets 把自定义单位发布为可复用定义集，"
         "再由四个接口凭标识选用。"
         "POST /custom-unit-set-migration/export 可一次导出 1～6 个已发布"
@@ -481,6 +491,7 @@ def _render_revisable_response(sheet_id: str, record: dict) -> RevisableWorkshee
     """把存储层记录渲染为可修订工作单响应（输入、结果与修订号同属一个快照）。"""
 
     worksheet = record["worksheet"]
+    binding = record.get("binding")
     return RevisableWorksheetResponse(
         id=sheet_id,
         revision=record["revision"],
@@ -493,6 +504,15 @@ def _render_revisable_response(sheet_id: str, record: dict) -> RevisableWorkshee
             WorksheetStep.model_validate(step) for step in worksheet["steps"]
         ],
         results=record["results"],
+        binding=(
+            WorksheetBindingInfo(
+                upstream_worksheet_id=binding["upstream_worksheet_id"],
+                step_name=binding["step_name"],
+                upstream_revision=binding["upstream_revision"],
+            )
+            if binding is not None
+            else None
+        ),
     )
 
 
@@ -597,6 +617,57 @@ def patch_revisable_worksheet_endpoint(
         worksheet_id, req.expected_revision, change, recalculate
     )
     return _render_revisable_response(worksheet_id, record)
+
+
+@app.post(
+    "/revisable-worksheets/{worksheet_id}/bindings",
+    response_model=RevisableWorksheetResponse,
+    response_model_exclude_none=True,
+    status_code=201,
+    responses={
+        404: {"description": "上游工作单标识不存在"},
+        409: {
+            "description": "expected_revision 与上游当前修订号不一致：未建立关联；"
+            "响应带回 current_revision",
+        },
+        422: {
+            "model": ErrorResponse,
+            "description": "上游已是别人的下游/已有自己的下游（一对一、非链式）、"
+            "步骤名在上游不存在或下游缺少同名初始变量、下游整单计算失败；"
+            "均不创建关联或下游工作单",
+        },
+    },
+    summary="把上游步骤结果绑定为新建下游工作单的初始变量（一对一、非链式；"
+    "下游固定同一份已发布定义集）",
+)
+def bind_step_result_endpoint(
+    worksheet_id: str, req: StepResultBindingRequest
+) -> RevisableWorksheetResponse:
+    # 路径标识为上游：校验 CAS 与一对一/非链式约束后，用上游当前步骤结果的
+    # value/unit 整体覆盖下游同名初始变量（下游沿用上游固定的同一定义集），
+    # 下游整单计算成功才在同一临界区共同保存关联与下游；任一步失败（404/409/
+    # 422）都不留下关联或下游工作单。
+    revision_store = get_revision_store()
+    unit_store = get_store()
+
+    body = WorksheetBody.model_validate(
+        req.model_dump(exclude={"step_name", "expected_revision"})
+    )
+
+    def recalculate(downstream_request: WorksheetRequest):
+        # 下游与其上游使用同一份（上游创建时固定的）已发布定义集；
+        # 在存储锁内被回调，但只走定义集存储的读路径，无锁嵌套问题。
+        scope = unit_store.build_scope(downstream_request.custom_unit_set_id)
+        return run_worksheet(downstream_request, scope)
+
+    downstream_id, record = revision_store.bind_downstream(
+        worksheet_id,
+        req.expected_revision,
+        req.step_name,
+        body,
+        recalculate,
+    )
+    return _render_revisable_response(downstream_id, record)
 
 
 @app.get("/health", summary="健康检查")

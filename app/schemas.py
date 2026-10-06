@@ -516,6 +516,57 @@ class RevisableWorksheetPatchRequest(BaseModel):
         return self
 
 
+class StepResultBindingRequest(WorksheetBody):
+    """POST /revisable-worksheets/{id}/bindings 请求体：把上游步骤结果绑定为下游初始变量。
+
+    路径参数 ``id`` 为**上游**工作单标识；本请求体是待创建的**下游**工作单
+    本体（2～5 步，不含单位来源——下游固定沿用上游创建时固定的同一份已发布
+    定义集标识）。``step_name`` 给出上游步骤结果名：下游必须存在同名初始
+    变量，关联建立时该变量的值与单位被该步骤结果的 ``value``/``unit``
+    **整体覆盖**后再整单计算；``expected_revision`` 为调用方读取到的上游
+    修订号，过期返回 409。
+    """
+
+    step_name: str = Field(
+        min_length=1,
+        max_length=32,
+        description="要绑定的上游步骤结果名；该步骤必须在上游工作单中存在，"
+        "且下游工作单必须存在同名初始变量（其值与单位由步骤结果覆盖）",
+    )
+    expected_revision: int = Field(
+        ge=1,
+        description="调用方读取到的上游当前修订号；与服务端不一致时返回 409，"
+        "不建立关联、不创建下游工作单",
+    )
+
+    @field_validator("step_name")
+    @classmethod
+    def _check_step_name(cls, name: str) -> str:
+        if not _VAR_NAME_RE.match(name):
+            raise ValueError(
+                f"步骤名 {name!r} 不合法：须以字母或下划线开头，"
+                "仅含字母、数字、下划线，长度不超过 32"
+            )
+        return name
+
+
+class WorksheetBindingInfo(BaseModel):
+    """下游工作单上记录的步骤结果绑定信息（读取下游时可见）。
+
+    - ``upstream_worksheet_id``：提供步骤结果的上游工作单标识；
+    - ``step_name``：被绑定的上游步骤结果名（同时也是下游被覆盖的初始变量名）；
+    - ``upstream_revision``：当前绑定变量值所对应的上游修订号：关联建立时
+      为关联时的上游修订号，每次上游修订联动下游后同步为新的上游修订号。
+    """
+
+    upstream_worksheet_id: str = Field(description="上游工作单标识（步骤结果的来源）")
+    step_name: str = Field(description="被绑定的上游步骤结果名（也是下游被覆盖的初始变量名）")
+    upstream_revision: int = Field(
+        ge=1,
+        description="绑定值对应的上游修订号；上游修订联动后与上游当前修订号一致",
+    )
+
+
 class StoredVariable(BaseModel):
     """读取/修订响应中的单个初始变量（值为精确十进制字符串）。"""
 
@@ -533,10 +584,12 @@ class RevisableWorksheetResponse(BaseModel):
     )
     custom_unit_set_id: str = Field(
         description="创建时固定下来的实际定义集标识（即使创建时用的是别名，"
-        "这里也是解析到的标识；别名此后切换不影响本工作单）"
+        "这里也是解析到的标识；别名此后切换不影响本工作单）；"
+        "存在绑定时，上下游两单的该标识必然相同"
     )
     variables: dict[str, StoredVariable] = Field(
-        description="当前修订的初始变量（单位表达式 + 精确十进制值）"
+        description="当前修订的初始变量（单位表达式 + 精确十进制值）；"
+        "被绑定的变量其值与单位来自上游步骤结果，直接修改它会返回 422"
     )
     steps: list[WorksheetStep] = Field(
         description="当前修订的步骤定义（2～5 个，顺序与执行顺序一致）"
@@ -544,6 +597,11 @@ class RevisableWorksheetResponse(BaseModel):
     results: list[WorksheetStepResult] = Field(
         description="当前修订在固定定义集下整单重算得到的逐步结果，"
         "与 variables、steps 同属 revision 这一修订"
+    )
+    binding: WorksheetBindingInfo | None = Field(
+        default=None,
+        description="本工作单作为下游时的绑定信息（上游标识、步骤名与对应"
+        "上游修订号）；无关联的工作单不返回该字段",
     )
 
 
