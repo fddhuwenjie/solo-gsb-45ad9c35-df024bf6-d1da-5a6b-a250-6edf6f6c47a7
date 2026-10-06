@@ -1,0 +1,16 @@
+services:
+  api:
+    build: .
+    image: unit-convert-api
+    ports:
+      # 默认 8000；可用 UNIT_API_PORT 覆盖（本机起第二个实例时改为 8001）
+      - "${UNIT_API_PORT:-8000}:8000"
+    environment:
+      # 已发布自定义单位定义集落盘目录；命名卷持久化，容器重建后仍可使用
+      UNIT_API_DATA_DIR: /data
+    volumes:
+      - unit_sets_data:/data
+    restart: unless-stopped
+
+volumes:
+  unit_sets_data:
