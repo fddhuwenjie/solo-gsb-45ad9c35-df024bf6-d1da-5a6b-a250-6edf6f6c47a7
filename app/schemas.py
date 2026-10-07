@@ -516,6 +516,23 @@ class RevisableWorksheetPatchRequest(BaseModel):
         return self
 
 
+class BoundVariableInfo(BaseModel):
+    """下游工作单上的结果绑定信息（读取下游时可见）。
+
+    下游的某个初始变量由上游工作单的某一步结果驱动：值与单位始终取自
+    上游 ``upstream_revision`` 修订下 ``step_name`` 步骤的结果，直接
+    PATCH 该绑定变量会被拒绝（422）；上游修订时服务端自动覆盖该变量
+    并整单重算下游、把这里的修订号同步到上游最新修订。
+    """
+
+    upstream_worksheet_id: str = Field(description="上游工作单标识")
+    step_name: str = Field(description="驱动绑定变量的上游步骤结果名")
+    variable: str = Field(description="下游被绑定（不可直接修改）的初始变量名")
+    upstream_revision: int = Field(
+        description="当前绑定值对应的上游修订号：上游每次成功修订后同步更新"
+    )
+
+
 class StoredVariable(BaseModel):
     """读取/修订响应中的单个初始变量（值为精确十进制字符串）。"""
 
@@ -544,6 +561,79 @@ class RevisableWorksheetResponse(BaseModel):
     results: list[WorksheetStepResult] = Field(
         description="当前修订在固定定义集下整单重算得到的逐步结果，"
         "与 variables、steps 同属 revision 这一修订"
+    )
+    binding: BoundVariableInfo | None = Field(
+        default=None,
+        description="本工作单作为下游时的结果绑定信息（上游标识、步骤、绑定"
+        "变量及对应上游修订号）；未关联其他工作单时省略，行为与原来一致",
+    )
+
+
+class WorksheetBindingCreateRequest(WorksheetBody):
+    """POST /revisable-worksheets/{id}/bindings 请求体。
+
+    把路径标识所指**上游**工作单的某一步结果绑定为一张新建**下游**
+    工作单（请求体中的变量与 2～5 个步骤）的初始变量：
+
+    - ``upstream_revision`` 必须是上游当前修订号，过期返回 409
+      （响应带回当前号）；上游不存在返回 404；
+    - ``step_name`` 必须是上游当前修订中某一步的结果名；
+    - ``bound_variable`` 必须是请求体变量映射中的某个初始变量名；该变量
+      提交的 value/unit 仅为占位，会被上游步骤结果的精确值与规范单位
+      **整体覆盖**；
+    - 下游不单独携带定义集引用——它与上游固定使用**同一份**已发布定义集；
+    - 只允许一对一关联：已作为上游/下游的工作单不能再参与新的关联，
+      也不允许链式关联（A→B 后不能 B→C 或 C→A）。
+    """
+
+    upstream_revision: int = Field(
+        ge=1,
+        description="调用方读取到的上游当前修订号；与上游当前修订号不一致时"
+        "返回 409（带回 current_revision）且不创建任何工作单",
+    )
+    step_name: str = Field(
+        min_length=1,
+        max_length=32,
+        description="上游工作单中提供结果的步骤结果名；该步骤不存在时返回 422",
+    )
+    bound_variable: str = Field(
+        min_length=1,
+        max_length=32,
+        description="下游（本请求体）中被绑定的初始变量名；其提交值与单位被"
+        "上游步骤结果覆盖；变量名不存在时返回 422",
+    )
+
+    @field_validator("step_name", "bound_variable")
+    @classmethod
+    def _check_binding_names(cls, name: str) -> str:
+        if not _VAR_NAME_RE.match(name):
+            raise ValueError(
+                f"名称 {name!r} 不合法：须以字母或下划线开头，"
+                "仅含字母、数字、下划线，长度不超过 32"
+            )
+        return name
+
+
+class WorksheetBindingResponse(BaseModel):
+    """结果绑定创建成功的响应：下游标识、两单修订号与绑定结果。"""
+
+    downstream_worksheet_id: str = Field(
+        description="服务为下游工作单生成的标识（不可猜测）"
+    )
+    upstream_worksheet_id: str = Field(description="上游工作单标识")
+    upstream_revision: int = Field(
+        description="绑定时上游的修订号（也是绑定结果对应的上游修订）"
+    )
+    downstream_revision: int = Field(
+        description="下游初始修订号（创建成功为 1）"
+    )
+    step_name: str = Field(description="提供绑定结果的上游步骤结果名")
+    bound_variable: str = Field(description="下游被绑定的初始变量名")
+    bound_result: WorksheetStepResult = Field(
+        description="覆盖绑定变量的上游步骤结果（精确值、规范单位与量纲）"
+    )
+    downstream: RevisableWorksheetResponse = Field(
+        description="新建的下游工作单完整内容（含 binding 信息）"
     )
 
 

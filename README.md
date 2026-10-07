@@ -11,6 +11,7 @@
 - **等式求解（`POST /solve`）**：用带单位的等式反求未知量：两侧以 `Fraction` 同步构建未知量的一次系数与常数项并校验量纲，支持 `+ - * /`、括号与纯常数幂，解精确换算到线性的 `output_unit`
 - **顺序计算工作单（`POST /worksheet`）**：一次请求提交初始带单位变量与 **2～5 个步骤**，每步要么是公式求值、要么是一次线性方程反求，给出唯一结果名与目标单位；后续步骤可按结果名引用先前步骤的结果，步骤间传递**精确分数数值与绝对温度属性**，返回各步骤的 `value`/`unit`/`dimension` 供核对完整过程；任一步错误返回 **422 且不返回部分结果**
 - **可修订工作单（`POST`/`GET`/`PATCH /revisable-worksheets`）**：把一份 2～5 步工作单连同**已发布定义集标识或活动别名**创建为可反复调整的持久化工作单。整单计算成功才保存输入、逐步结果、实际使用的定义集标识与初始修订号（`revision=1`）；按标识读取当前内容、结果与修订号；修订时必须携带**预期修订号**，每次只能替换一个初始变量的值与单位、或一个现有步骤（按结果名定位、名称不变）的公式/方程及目标单位，随后**整单重算**并共同保存新输入、新逐步结果与递增修订号（下游步骤不沿用旧结果）。同一修订的并发修改最多一项成功，其余返回 **409**；计算失败返回 **422**、写盘失败回滚，二者都不改变已保存内容；别名切换后仍使用创建时固定的定义；并发读取只见同一修订的输入与结果；**容器重建后仍可读取并继续修订**
+- **跨工作单结果绑定（`POST /revisable-worksheets/{id}/bindings`）**：把**上游**工作单的某一步结果绑定为一张新建**下游**工作单（变量 + 2～5 步）的初始变量：提交上游标识、步骤名、`upstream_revision` 与含绑定变量的下游工作单，以步骤结果的**值和单位**覆盖该变量，下游整单计算成功才共同保存关联与下游，返回下游标识、两单修订号与绑定结果。两单固定使用**同一份**已发布定义集；只允许**一对一**关联，**不允许链式**。此后沿用 `PATCH /revisable-worksheets/{id}` 修订上游时，服务端自动用新结果覆盖绑定变量并**整单重算下游**，两单的输入、结果与修订号在同一临界区共同落盘（下游重算失败 **422** 或写盘失败时**两单均不变**，读者见不到混版）；下游仍可修订其他变量或步骤，**直接修改绑定变量返回 422**；上游不存在 **404**、修订号过期返回带当前号的 **409**。读取下游可见上游标识、步骤与对应修订号，**容器重建后关联仍生效**；无关联工作单行为不变
 
 - **工作单换版诊断（`POST /worksheet-diagnose`）**：一次请求提交同一份 2～5 步工作单与旧、新两份**已发布**定义集的标识或活动别名；请求开始时分别固定两侧实际指向，用各自定义各执行一遍（只读、不改定义集或别名），逐步并排返回两侧结果与**首个含义变化**。比较按 **SI 口径精确分数数值、量纲与绝对温度属性**进行，而非显示字符串——旧版 `span=2 m`、新版 `span=3 m` 时输入 `1 span` 并输出到 `span`，两侧虽都显示 `1 span` 也会报告物理值已变。某一侧第 k 步业务失败时保留此前步骤对照并回报该步错误，失败后步骤标记 `not_run` 不计成功；未知定义集/别名或非法请求返回 422
 - **工作单输入迁移（`POST /worksheet-migrate`）**：一次请求提交现有 2～5 步工作单与旧、新定义集标识或活动别名（请求开始分别固定两侧实际指向）；先在旧定义下执行，再把每个初始变量改写成**新定义下单位表达式相同、物理量（含量纲与绝对温度属性）也相同的精确十进制值**，返回可直接交给 `/worksheet` 的新工作单（引用固定的新定义集标识）。改写后整张工作单在新定义下再执行一遍，逐步核对内部精确量、量纲与绝对温度属性（显示值允许变化）；旧工作单出错、新定义下变量或步骤单位不兼容、改写值无法精确十进制表示、新工作单出错或结果含义变化时返回 **422 并指出变量或步骤**，不返回迁移工作单。操作只读，不改写定义集或别名
@@ -1181,6 +1182,163 @@ curl -X PATCH http://localhost:8000/revisable-worksheets/rws_1f2e3d4c5b6a7988776
 `GET` 仍返回最后一次成功修订，并可继续 `PATCH` 修订；既有的
 `POST /worksheet` 等所有调用与 Compose 启动方式保持不变。
 
+### 跨工作单结果绑定（`POST /revisable-worksheets/{id}/bindings`）
+
+有时一张工作单的步骤结果要作为**另一张**工作单的初始输入，并希望上游调整后
+下游自动跟进。**结果绑定**把上游工作单（路径 `{id}`）的某一步结果绑定为一张
+新建下游工作单的初始变量：
+
+- **同一已发布定义集**：下游不单独提交定义集引用，它与上游固定使用
+  **同一份**创建上游时固定下来的定义集；
+- **值与单位整体覆盖**：下游请求体中绑定变量（`bound_variable`）提交的
+  `value`/`unit` 仅为占位，创建时被上游 `step_name` 步骤结果的精确值与
+  规范单位**整体覆盖**；
+- **一对一、无链式**：每张工作单至多参与一个关联（A→B 后不能再 A→C、
+  B→C 或 C→A，也不能自关联）；互不相关的多对关联互不影响；
+- **计算成功才保存**：下游整单重算成功后关联与下游才共同原子落盘；
+  上游不存在 **404**、`upstream_revision` 过期 **409**（响应带回
+  `current_revision`）、步骤名/绑定变量不存在或违反一对一/无链式约束、
+  下游任一步计算失败均为 **422**，失败不创建下游、不保存关联；
+- **上游修订自动联动**：随后仍走原 `PATCH /revisable-worksheets/{id}`
+  修订上游——服务端用新的绑定步骤结果覆盖下游绑定变量并**重算整张下游**，
+  两单的输入、结果与修订号在同一临界区共同落盘；下游自身修订号同步 +1，
+  绑定信息中的上游修订号同步为最新值；
+- **失败两单都不变**：联动重算时下游任一步失败返回 **422**（在任何写入
+  之前），写盘失败回滚——两种失败下两单的输入、结果与修订号全部保持
+  原样；并发读者不会见到“上游已改、下游仍旧”的混版状态；
+- **下游仍可自治**：下游可以照常 `PATCH` 其他初始变量或步骤（其修订号
+  照常递增），但**直接修改绑定变量返回 422**；
+- **读取可见关联**：`GET` 下游响应中的 `binding` 字段给出上游标识、步骤名、
+  绑定变量及对应上游修订号；无关联工作单响应不含该字段，行为与原来完全
+  一致；关联随下游记录保存在 `revisable_worksheets.json` 中，
+  **容器/进程重建后关联仍生效**。
+
+**第 1 步：先有一张上游可修订工作单**（创建方式见上一节，假设其标识为
+`rws_upper`，当前 `revision=1`，步骤 `s = v*t = 120 km`）。
+
+**第 2 步：创建关联与下游（`POST /revisable-worksheets/{id}/bindings`，201）**
+
+```bash
+curl -X POST http://localhost:8000/revisable-worksheets/rws_upper/bindings \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "upstream_revision": 1,
+    "step_name": "s",
+    "bound_variable": "x",
+    "variables": {
+      "x": {"value": "0", "unit": "km"}
+    },
+    "steps": [
+      {"name": "y", "formula": "x/2", "output_unit": "km"},
+      {"name": "z", "formula": "y",   "output_unit": "m"}
+    ]
+  }'
+```
+
+`variables.x` 提交的 `0 km` 只是占位，会被上游步骤 `s` 的结果 `120 km`
+整体覆盖（下游不再携带 `custom_unit_set_id`，自动固定为上游的同一份定义集）：
+
+```json
+{
+  "downstream_worksheet_id": "rws_lower",
+  "upstream_worksheet_id": "rws_upper",
+  "upstream_revision": 1,
+  "downstream_revision": 1,
+  "step_name": "s",
+  "bound_variable": "x",
+  "bound_result": {"name": "s", "value": "120", "unit": "km", "dimension": "m"},
+  "downstream": {
+    "id": "rws_lower", "revision": 1, "custom_unit_set_id": "cus_...",
+    "variables": {"x": {"value": "120", "unit": "km"}},
+    "steps": [
+      {"name": "y", "formula": "x/2", "output_unit": "km"},
+      {"name": "z", "formula": "y",   "output_unit": "m"}
+    ],
+    "results": [
+      {"name": "y", "value": "60",    "unit": "km", "dimension": "m"},
+      {"name": "z", "value": "60000", "unit": "m",  "dimension": "m"}
+    ],
+    "binding": {
+      "upstream_worksheet_id": "rws_upper",
+      "step_name": "s",
+      "variable": "x",
+      "upstream_revision": 1
+    }
+  }
+}
+```
+
+**第 3 步：修订上游，下游自动联动（原 `PATCH` 接口，请求无任何变化）**
+
+```bash
+# 上游 t: 2 h -> 3 h，则 s = 60*3 = 180 km
+curl -X PATCH http://localhost:8000/revisable-worksheets/rws_upper \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_revision": 1,
+    "variable": {"name": "t", "value": "3", "unit": "h"}
+  }'
+```
+
+上游响应为通常的修订后完整结构（`revision=2`，`s=180`）。同一临界区内下游
+已被联动重算——读取下游可见绑定变量、结果、下游自身修订号与绑定中的上游
+修订号全部同步：
+
+```bash
+curl http://localhost:8000/revisable-worksheets/rws_lower
+```
+
+```json
+{
+  "id": "rws_lower", "revision": 2, "custom_unit_set_id": "cus_...",
+  "variables": {"x": {"value": "180", "unit": "km"}},
+  "steps": [
+    {"name": "y", "formula": "x/2", "output_unit": "km"},
+    {"name": "z", "formula": "y",   "output_unit": "m"}
+  ],
+  "results": [
+    {"name": "y", "value": "90",    "unit": "km", "dimension": "m"},
+    {"name": "z", "value": "90000", "unit": "m",  "dimension": "m"}
+  ],
+  "binding": {
+    "upstream_worksheet_id": "rws_upper",
+    "step_name": "s",
+    "variable": "x",
+    "upstream_revision": 2
+  }
+}
+```
+
+联动期间仍可正常修订下游的其他变量或步骤（下游修订号照常递增，不受联动
+之外的影响）；但直接 `PATCH` 绑定变量 `x` 返回 **422**：
+
+```bash
+# 直接改绑定变量：422 invalid_request，下游不变
+curl -X PATCH http://localhost:8000/revisable-worksheets/rws_lower \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 2,
+       "variable": {"name": "x", "value": "1", "unit": "km"}}'
+```
+
+```json
+{"detail": {"error": "invalid_request",
+            "message": "初始变量 'x' 已绑定到上游工作单 'rws_upper' 的步骤 's' 的结果：绑定变量由上游修订自动驱动，不能直接修改；可修订其他变量或步骤"}}
+```
+
+绑定的错误语义：
+
+| 情况 | 状态 | 已保存内容 |
+| ---- | ---- | ---------- |
+| 上游工作单标识不存在 | **404** `worksheet_not_found` | 不创建下游、不保存关联 |
+| `upstream_revision` 与上游当前修订号不一致 | **409** `revision_conflict`（含 `current_revision`） | 不创建下游、不保存关联 |
+| `step_name` 在上游当前修订中不存在 | **422** `invalid_request` | 不创建下游、不保存关联 |
+| `bound_variable` 不在下游请求体变量中 | **422** `invalid_request` | 不创建下游、不保存关联 |
+| 上游已绑定过下游，或上游自身已是下游（链式） | **422** `invalid_request` | 不创建下游、不保存关联 |
+| 下游工作单非法（步骤数、重名等）或整单重算任一步失败 | **422**（错误码同 `/worksheet`） | 不创建下游、不保存关联 |
+| 修订上游导致下游重算失败（如除零、量纲冲突） | **422** | **上游与下游都保持原修订**，可按原修订号重试 |
+| 联动提交时服务端写盘失败 | **500**（内存已回滚） | **两单**输入、结果与修订号均不变，可按原修订号重试 |
+| 直接 PATCH 下游绑定变量 | **422** `invalid_request` | 下游不变 |
+
 ### 其他端点
 
 | 端点         | 说明                             |
@@ -1189,7 +1347,8 @@ curl -X PATCH http://localhost:8000/revisable-worksheets/rws_1f2e3d4c5b6a7988776
 | `POST /worksheet-migrate` | 工作单输入迁移：把现有 2～5 步工作单的初始变量改写为新定义集下物理量相同的精确十进制值，返回可直接交给 `/worksheet` 的新工作单（引用固定的新标识）；失败 422 并指出变量或步骤 |
 | `POST /revisable-worksheets` | 创建可修订工作单（201）：提交 2～5 步工作单与已发布定义集标识或活动别名，整单成功才保存输入、逐步结果、固定定义集标识与初始修订号 1，返回工作单标识；引用不存在或任一步失败 422 且不创建 |
 | `GET /revisable-worksheets/{id}` | 读取可修订工作单当前修订的输入、步骤定义、逐步结果与修订号；不存在 404 |
-| `PATCH /revisable-worksheets/{id}` | 修订可修订工作单：携带 `expected_revision`，只替换一个初始变量或一个现有步骤（名称不变），整单重算后共同保存并把修订号 +1；修订号冲突 409（带回 `current_revision`）、标识不存在 404、修改非法或重算失败 422；写盘失败回滚，均不改变已保存内容 |
+| `PATCH /revisable-worksheets/{id}` | 修订可修订工作单：携带 `expected_revision`，只替换一个初始变量或一个现有步骤（名称不变），整单重算后共同保存并把修订号 +1；修订号冲突 409（带回 `current_revision`）、标识不存在 404、修改非法或重算失败 422；写盘失败回滚，均不改变已保存内容。若该单已关联下游：自动覆盖绑定变量并重算整张下游，两单输入/结果/修订号共同落盘；下游重算失败 422 或写盘失败时两单都不变 |
+| `POST /revisable-worksheets/{id}/bindings` | 跨工作单结果绑定（201）：提交上游标识、步骤名、`upstream_revision` 与含绑定变量的下游工作单（2～5 步），以步骤结果的值和单位覆盖绑定变量，下游整单计算成功才共同保存关联与下游，返回下游标识、两单修订号与绑定结果；两单固定同一份已发布定义集，仅一对一、无链式；上游不存在 404、修订号过期 409（带回当前号）、步骤名/绑定变量不存在、一对一/链式冲突或下游重算失败 422，均不创建下游 |
 | `POST /custom-unit-sets` | 发布 1～6 项自定义单位定义为可复用定义集，返回服务生成标识（201） |
 | `GET /custom-unit-set-aliases` | 列出全部活动别名及其当前指向的定义集标识 |
 | `GET /custom-unit-set-aliases/{alias}` | 查询单个活动别名当前指向（不存在返回 422） |

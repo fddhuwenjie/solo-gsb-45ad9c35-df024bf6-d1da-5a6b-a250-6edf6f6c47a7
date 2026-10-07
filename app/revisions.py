@@ -15,6 +15,28 @@
   不变）的公式/方程及目标单位；整单重新计算成功后，新输入、新的逐步
   结果与递增的修订号在同一临界区内共同保存。
 
+**跨工作单结果绑定（worksheets binding）**：可把一张工作单（下游）的
+某个初始变量绑定为另一张工作单（上游）某一步的结果：
+
+- ``POST /revisable-worksheets/{id}/bindings``：提交上游预期修订号、
+  步骤结果名、绑定变量名及含该变量的下游工作单（变量 + 2～5 步）；
+  下游与上游固定使用**同一份**已发布定义集，绑定变量提交的值与单位
+  被上游步骤结果的精确值与规范单位整体覆盖，下游整单计算成功后才把
+  关联与下游共同保存，返回下游标识、两单修订号与绑定结果。上游不
+  存在 404、修订号过期 409（带回当前号）、其余非法 422，均不落任何
+  痕迹；
+- 只允许**一对一**关联：每张工作单至多作为一个关联的上游或下游，
+  **不允许链式关联**（A→B 后不能再 B→C 或 C→A），也不能自关联；
+- 上游随后走原 ``PATCH`` 修订：服务端用新的绑定步骤结果覆盖下游
+  绑定变量、整单重算下游，并在同一临界区把两单的输入、结果与修订号
+  共同落盘——下游重算失败（422）或写盘失败时两单都保持原样，读者
+  绝不会看到两单的混版状态；下游自身的修订号同时 +1，绑定信息中的
+  上游修订号同步为上游最新修订；
+- 下游仍可修订其他变量或步骤，但直接 PATCH 绑定变量返回 422；
+- 绑定信息保存在下游记录中（同一 JSON 文件），容器/进程重建后关联
+  继续生效；读取下游响应中的 ``binding`` 字段可见上游标识、步骤名、
+  绑定变量及对应上游修订号。
+
 保证：
 
 - **整单重算**：修订时从新的初始变量开始重跑全部步骤，下游步骤绝不
@@ -165,6 +187,16 @@ class RevisionStore:
             loaded: dict[str, dict] = {}
             for sheet_id, record in sheets.items():
                 loaded[sheet_id] = self._validate_record(sheet_id, record)
+            # 第二遍校验绑定引用：上游必须存在（自关联、悬空引用、链式关联
+            # 在正常写路径上都不可能出现，磁盘文件被外部改坏时让启动失败，
+            # 宁可不可用也不静默丢关联）
+            for sheet_id, record in loaded.items():
+                binding = record.get("binding")
+                if binding is not None and binding["upstream_worksheet_id"] not in loaded:
+                    raise ValueError(
+                        f"可修订工作单 {sheet_id!r} 的绑定上游 "
+                        f"{binding['upstream_worksheet_id']!r} 不存在: {self._path}"
+                    )
             self._sheets = loaded
             self._loaded = True
 
@@ -233,22 +265,26 @@ class RevisionStore:
     ) -> dict:
         """在乐观并发保护下应用修改、整单重算并提交新修订。
 
-        整个“CAS 判定 → 应用修改 → schema 重校验 → 整单重算 → 修订号递增
-        → 原子落盘”在同一把锁内完成（重算只是 2～5 步精确分数运算，持锁
-        开销可忽略；scope 由调用方在进入本方法前构造好，因此不会与定义集
-        存储发生锁嵌套）：
+        整个“CAS 判定 → 应用修改 → schema 重校验 → 整单重算 → （若本单是
+        上游：驱动下游绑定变量并重算下游）→ 修订号递增 → 原子落盘”在同一把
+        锁内完成（重算只是 2～5 步精确分数运算，持锁开销可忽略；scope 由
+        调用方在进入本方法前构造好，因此不会与定义集存储发生锁嵌套）：
 
         1. 当前工作单不存在：抛 :class:`RevisionNotFoundError`（404）；
         2. 当前修订号与 ``expected_revision`` 不一致：抛
            :class:`RevisionConflictError`（409），落选请求在任何重算之前
            即返回，不改变已保存内容；
-        3. 把单项目修改应用到当前快照并重新做 schema 校验：非法抛 422，
-           发生在任何写入之前；
+        3. 把单项目修改应用到当前快照并重新做 schema 校验：非法抛 422
+           （含直接修改下游绑定变量），发生在任何写入之前；
         4. 用调用方提供的 ``recalculate`` 对修改后的整单从头重算（全部步骤
            结果都来自本次计算，绝不沿用旧修订的步骤结果）：业务失败抛 422，
            同样发生在任何写入之前；
-        5. 修订号 +1，新输入与新逐步结果共同原子落盘；写盘失败回滚内存中
-           的全部改动，已保存的输入、结果与修订号保持原样。
+        5. 若本单已被一个下游关联，则用新的绑定步骤结果（值与单位）覆盖
+           下游绑定变量并把下游整单重算；绑定步骤在新修订中不存在或下游
+           任一步失败抛 422，两单都不改变；下游自身修订号同时 +1，绑定
+           信息中的上游修订号同步为新修订；
+        6. 两单修订号 +1、输入与逐步结果共同原子落盘；写盘失败回滚内存中
+           的全部改动，两单已保存的输入、结果与修订号都保持原样。
 
         返回新修订记录的深拷贝（含 ``id``）。
         """
@@ -267,19 +303,171 @@ class RevisionStore:
             # 整单重算：失败抛 422，record 仍保持原修订内容
             results = recalculate(changed_request)
 
-            previous = deepcopy(record)
+            # 若本单是某个一对一关联的上游，同步驱动下游：绑定步骤的新结果
+            # 覆盖下游绑定变量，下游从新初始变量开始整单重算。任何失败在
+            # 下面的提交之前抛出，两单都保持原修订。
+            downstream_id = self._downstream_of_locked(worksheet_id)
+            downstream_commit: tuple[dict, dict, list[WorksheetStepResult]] | None = None
+            if downstream_id is not None:
+                downstream_record = self._sheets[downstream_id]
+                bound = downstream_record["binding"]
+                bound_result = _result_by_name(results, bound["step_name"])
+                if bound_result is None:
+                    raise _invalid_revision_request(
+                        f"下游绑定的步骤 {bound['step_name']!r} 在修订后的上游"
+                        "工作单中不存在：步骤只能整体替换（名称不变），关联未改变"
+                    )
+                downstream_request = _bound_downstream_request(
+                    downstream_record, bound_result
+                )
+                downstream_results = recalculate(downstream_request)
+                downstream_commit = (
+                    downstream_record,
+                    _dump_body(downstream_request),
+                    downstream_results,
+                )
+
+            # 先保留两单回滚副本，全部计算已成功，才进入“内存修改 + 落盘”
+            previous_upstream = deepcopy(record)
             record["revision"] = expected_revision + 1
             record["worksheet"] = _dump_body(changed_request)
             record["results"] = [_dump_result(r) for r in results]
+            previous_downstream = None
+            if downstream_commit is not None:
+                downstream_record, downstream_body, downstream_results = downstream_commit
+                previous_downstream = deepcopy(downstream_record)
+                downstream_record["revision"] += 1
+                downstream_record["worksheet"] = downstream_body
+                downstream_record["results"] = [
+                    _dump_result(r) for r in downstream_results
+                ]
+                downstream_record["binding"]["upstream_revision"] = (
+                    expected_revision + 1
+                )
             try:
                 self._persist_locked()
             except Exception:
-                # 写盘失败：回滚到上一修订，修订与落盘必须共同生效
-                self._sheets[worksheet_id] = previous
+                # 写盘失败：两单一起回滚到上一修订，修订与落盘必须共同生效
+                self._sheets[worksheet_id] = previous_upstream
+                if previous_downstream is not None:
+                    self._sheets[downstream_id] = previous_downstream  # type: ignore[possibly-undefined]
                 raise
             return deepcopy(record)
 
+    def create_binding(
+        self,
+        upstream_id: str,
+        expected_revision: int,
+        step_name: str,
+        bound_variable: str,
+        downstream_body: WorksheetBody,
+        run_downstream: Callable[[WorksheetRequest], list[WorksheetStepResult]],
+    ) -> tuple[str, dict, WorksheetStepResult]:
+        """校验并创建一对一结果绑定与下游工作单，共同原子落盘。
+
+        ``run_downstream`` 由调用方提供（按上游固定的定义集构造 scope），
+        与 :meth:`revise` 的重算回调一致，避免本层与定义集存储发生锁嵌套。
+        全部校验与计算都在任何写入之前完成：
+
+        1. 上游不存在：:class:`RevisionNotFoundError`（404，先于 CAS 判定）；
+        2. 上游当前修订号与 ``expected_revision`` 不一致：
+           :class:`RevisionConflictError`（409，带回当前号）；
+        3. 步骤结果名在上游当前修订中不存在、绑定变量不在下游请求体中、
+           两单定义集不是同一份、或一对一/无链式/不自关联约束被破坏：422；
+        4. 用上游步骤结果（精确值与规范单位）覆盖绑定变量，整单执行下游：
+           任一步失败 422；
+        5. 关联与下游初始修订（1）共同原子落盘；写盘失败删除刚创建的下游，
+           上游与已保存内容均不改变。
+
+        返回 ``(下游标识, 下游新记录深拷贝, 绑定步骤结果)``。
+        """
+
+        self._ensure_loaded()
+        with self._lock:
+            upstream = self._sheets.get(upstream_id)
+            if upstream is None:
+                raise RevisionNotFoundError(upstream_id)
+            if upstream["revision"] != expected_revision:
+                raise RevisionConflictError(
+                    upstream_id, upstream["revision"], expected_revision
+                )
+            bound_result = _result_by_name(
+                [WorksheetStepResult.model_validate(r) for r in upstream["results"]],
+                step_name,
+            )
+            if bound_result is None:
+                raise _invalid_revision_request(
+                    f"上游工作单 {upstream_id!r} 的当前修订中不存在结果名为 "
+                    f"{step_name!r} 的步骤"
+                )
+            if bound_variable not in downstream_body.variables:
+                raise _invalid_revision_request(
+                    f"下游工作单中不存在要绑定的初始变量 {bound_variable!r}："
+                    "绑定变量必须是下游请求体 variables 中的现有变量"
+                )
+
+            # 一对一 + 无链式 + 不自关联：上游不能已是下游，不能已绑定过别的
+            # 下游；新下游使用新标识（尚不存在），但仍拒绝把既有下游再当上游
+            # 的链式形态以及自关联（ID 碰撞在生成时另行规避）。
+            if upstream.get("binding") is not None:
+                raise _invalid_revision_request(
+                    f"上游工作单 {upstream_id!r} 已作为另一张工作单的下游："
+                    "不允许链式关联"
+                )
+            if self._downstream_of_locked(upstream_id) is not None:
+                raise _invalid_revision_request(
+                    f"上游工作单 {upstream_id!r} 已绑定过一个下游工作单："
+                    "只允许一对一关联"
+                )
+
+            downstream_request = WorksheetRequest.model_validate(
+                {
+                    **downstream_body.model_dump(),
+                    "custom_unit_set_id": upstream["custom_unit_set_id"],
+                }
+            )
+            # 覆盖必须在 schema 重校验之后作用于对象（值/单位取自上游步骤结果）
+            downstream_request.variables[bound_variable].value = bound_result.value
+            downstream_request.variables[bound_variable].unit = bound_result.unit
+            # 覆盖后再走一次与 /worksheet 相同的变量精度等校验
+            downstream_results = run_downstream(downstream_request)
+
+            while True:
+                downstream_id = _ID_PREFIX + secrets.token_hex(_ID_BYTES)
+                if downstream_id not in self._sheets and downstream_id != upstream_id:
+                    break
+            record = {
+                "revision": INITIAL_REVISION,
+                "custom_unit_set_id": upstream["custom_unit_set_id"],
+                "worksheet": _dump_body(downstream_request),
+                "results": [_dump_result(r) for r in downstream_results],
+                "binding": {
+                    "upstream_worksheet_id": upstream_id,
+                    "step_name": step_name,
+                    "variable": bound_variable,
+                    "upstream_revision": expected_revision,
+                },
+            }
+            self._sheets[downstream_id] = deepcopy(record)
+            try:
+                self._persist_locked()
+            except Exception:
+                # 写盘失败：下游不落任何痕迹，上游与已保存内容保持原样
+                del self._sheets[downstream_id]
+                raise
+            record["id"] = downstream_id
+            return downstream_id, deepcopy(record), bound_result
+
     # -- 内部 -------------------------------------------------------------
+
+    def _downstream_of_locked(self, upstream_id: str) -> str | None:
+        """返回与给定上游一对一关联的下游标识；无关联时为 None（调用方持锁）。"""
+
+        for sheet_id, record in self._sheets.items():
+            binding = record.get("binding")
+            if binding is not None and binding["upstream_worksheet_id"] == upstream_id:
+                return sheet_id
+        return None
 
     def _apply_change_locked(
         self, record: dict, change: VariableChange | StepChange
@@ -301,6 +489,16 @@ class RevisionStore:
                 raise _invalid_revision_request(
                     f"要修改的初始变量 {name!r} 不存在：修订只能替换已有初始"
                     "变量的值与单位，不能新增、删除变量或更改变量名"
+                )
+            if (
+                record.get("binding") is not None
+                and record["binding"]["variable"] == name
+            ):
+                raise _invalid_revision_request(
+                    f"初始变量 {name!r} 已绑定到上游工作单 "
+                    f"{record['binding']['upstream_worksheet_id']!r} 的步骤 "
+                    f"{record['binding']['step_name']!r} 的结果：绑定变量由上游"
+                    "修订自动驱动，不能直接修改；可修订其他变量或步骤"
                 )
             variables[name] = {"value": str(change.value), "unit": change.unit}
         else:
@@ -346,11 +544,49 @@ class RevisionStore:
         parsed_results = [WorksheetStepResult.model_validate(item) for item in results]
         if len(parsed_results) != len(body.steps):
             raise ValueError(f"可修订工作单 {sheet_id!r} 的结果数与步骤数不一致: {self._path}")
-        return {
+        validated = {
             "revision": revision,
             "custom_unit_set_id": set_id,
             "worksheet": _dump_body(body),
             "results": [_dump_result(r) for r in parsed_results],
+        }
+        # 绑定信息为可选字段：存在时校验结构、上游修订号与绑定变量/步骤名
+        # 仍能在本单/上游中找到（上游存在性由 load 的第二遍检查保证）
+        binding = record.get("binding")
+        if binding is not None:
+            validated["binding"] = self._validate_binding_locked(
+                sheet_id, binding, validated
+            )
+        return validated
+
+    def _validate_binding_locked(
+        self, sheet_id: str, binding: object, own_record: dict
+    ) -> dict:
+        """加载时校验下游记录中的绑定块（引用完整性）。"""
+
+        if not isinstance(binding, dict):
+            raise ValueError(f"可修订工作单 {sheet_id!r} 的绑定信息格式非法: {self._path}")
+        upstream_id = binding.get("upstream_worksheet_id")
+        step_name = binding.get("step_name")
+        variable = binding.get("variable")
+        upstream_revision = binding.get("upstream_revision")
+        if (
+            not isinstance(upstream_id, str)
+            or not isinstance(step_name, str)
+            or not isinstance(variable, str)
+            or not isinstance(upstream_revision, int)
+            or upstream_revision < INITIAL_REVISION
+        ):
+            raise ValueError(f"可修订工作单 {sheet_id!r} 的绑定字段格式非法: {self._path}")
+        if variable not in own_record["worksheet"]["variables"]:
+            raise ValueError(
+                f"可修订工作单 {sheet_id!r} 的绑定变量 {variable!r} 不存在: {self._path}"
+            )
+        return {
+            "upstream_worksheet_id": upstream_id,
+            "step_name": step_name,
+            "variable": variable,
+            "upstream_revision": upstream_revision,
         }
 
     def _persist_locked(self) -> None:
@@ -380,6 +616,36 @@ def _dump_body(body: WorksheetBody) -> dict:
 
 def _dump_result(result: WorksheetStepResult) -> dict:
     return result.model_dump()
+
+
+def _result_by_name(
+    results: list[WorksheetStepResult], name: str
+) -> WorksheetStepResult | None:
+    """按结果名取步骤结果；不存在时返回 None。"""
+
+    return next((r for r in results if r.name == name), None)
+
+
+def _bound_downstream_request(
+    downstream_record: dict, bound_result: WorksheetStepResult
+) -> WorksheetRequest:
+    """用上游步骤结果覆盖下游绑定变量，组装待整单重算的下游请求。
+
+    覆盖作用在当前快照的深拷贝上并重新做 schema 校验；失败抛 422，
+    发生在任何写入之前。
+    """
+
+    body_raw = deepcopy(downstream_record["worksheet"])
+    variable = downstream_record["binding"]["variable"]
+    body_raw["variables"][variable] = {
+        "value": bound_result.value,
+        "unit": bound_result.unit,
+    }
+    body_raw["custom_unit_set_id"] = downstream_record["custom_unit_set_id"]
+    try:
+        return WorksheetRequest.model_validate(body_raw)
+    except ValueError as exc:
+        raise _invalid_revision_request(f"覆盖绑定变量后的下游工作单不合法: {exc}") from None
 
 
 # ---------------------------------------------------------------------------
